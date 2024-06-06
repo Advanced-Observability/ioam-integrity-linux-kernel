@@ -1,0 +1,354 @@
+diff --git a/include/net/ioam6.h b/include/net/ioam6.h
+index 2cbbee6e806a..5399dca99b56 100644
+--- a/include/net/ioam6.h
++++ b/include/net/ioam6.h
+@@ -43,6 +43,7 @@ struct ioam6_pernet_data {
+ 	struct mutex lock;
+ 	struct rhashtable namespaces;
+ 	struct rhashtable schemas;
++	struct crypto_aead *tfm;
+ };
+ 
+ static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
+@@ -55,11 +56,18 @@ static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
+ }
+ 
+ struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id);
++struct crypto_aead *ioam6_crypto(struct net *net);
++
+ void ioam6_fill_trace_data(struct sk_buff *skb,
+ 			   struct ioam6_namespace *ns,
+ 			   struct ioam6_trace_hdr *trace,
+ 			   bool is_input);
+ 
++bool ioam6_aes_gmac(struct crypto_aead *tfm, u8 *iv,
++		    u8 *tag, u8 *aad, size_t aad_len);
++bool ioam6_valid_aes_gmac(struct crypto_aead *tfm, u8 *iv,
++			  u8 *tag, u8 *aad, size_t aad_len);
++
+ int ioam6_init(void);
+ void ioam6_exit(void);
+ 
+diff --git a/include/uapi/linux/ioam6.h b/include/uapi/linux/ioam6.h
+index 8f72b24fefb3..129c111c261d 100644
+--- a/include/uapi/linux/ioam6.h
++++ b/include/uapi/linux/ioam6.h
+@@ -29,9 +29,24 @@ struct ioam6_hdr {
+ 	__u8 opt_len;
+ 	__u8 :8;				/* reserved */
+ #define IOAM6_TYPE_PREALLOC 0
++#define IOAM6_TYPE_INT_PREALLOC 64
+ 	__u8 type;
+ } __attribute__((packed));
+ 
++/*
++ * IOAM Integrity 1 Protected Trace Header
++ */
++#define IOAM6_INTEGRITY_1 1
++struct ioam6_integrity_1_hdr {
++	__u8 suite_id;
++	__u8 nonce_len;
++	__be16 __reserved;
++#define IOAM6_GMAC_NONCE_SIZE 12
++	__u8 nonce[IOAM6_GMAC_NONCE_SIZE];
++#define IOAM6_GMAC_TAG_SIZE 16
++	__u8 icv[IOAM6_GMAC_TAG_SIZE];
++} __attribute__((packed));
++
+ /*
+  * IOAM Trace Header
+  */
+@@ -126,7 +141,7 @@ struct ioam6_trace_hdr {
+ #error "Please fix <asm/byteorder.h>"
+ #endif
+ 
+-#define IOAM6_TRACE_DATA_SIZE_MAX 244
++#define IOAM6_TRACE_DATA_SIZE_MAX 212
+ 	__u8	data[];
+ } __attribute__((packed));
+ 
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index 26f1e4a5ade0..7e2fba6236ad 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -961,6 +961,87 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
+ 		ioam6_event(IOAM6_EVENT_TRACE, dev_net(skb->dev),
+ 			    GFP_ATOMIC, (void *)trace, hdr->opt_len - 2);
+ 		break;
++	case IOAM6_TYPE_INT_PREALLOC:
++		if (hdr->opt_len < 3)
++			goto drop;
++
++		u8 *nh = skb_network_header(skb) + optoff + sizeof(*hdr);
++		struct ioam6_integrity_1_hdr *i1hdr;
++
++		switch (nh[0]) {
++		case IOAM6_INTEGRITY_1:
++			if (hdr->opt_len < 2 + sizeof(*i1hdr) + sizeof(*trace))
++				goto drop;
++
++			i1hdr = (struct ioam6_integrity_1_hdr *)nh;
++			trace = (struct ioam6_trace_hdr *)(nh + sizeof(*i1hdr));
++
++			/* TODO
++			 * Right now, we just print if it succeeds or fails.
++			 *
++			 * Instead, when it fails, we'll report it (or not?) as
++			 * an ioam6 event, e.g., IOAM6_EVENT_TRACE_FALSIFIED.
++			 * In that case, a drop is not what we want: we just
++			 * skip and don't process the IOAM option. If it
++			 * succeeds, we'll report the trace as the ioam6 event
++			 * IOAM6_EVENT_TRACE *after* the processing.
++			 */
++			if (!ioam6_valid_aes_gmac(
++					ioam6_crypto(dev_net(skb->dev)),
++					i1hdr->nonce, i1hdr->icv, (u8 *)trace,
++					hdr->opt_len - 2 - sizeof(*i1hdr))) {
++				printk(KERN_EMERG "IOAM trace integrity check failed\n");
++				goto ignore;
++			}
++
++			if (hdr->opt_len < 2 + sizeof(*i1hdr)
++			     + sizeof(*trace) + trace->remlen * 4)
++				goto drop;
++
++			ns = ioam6_namespace(dev_net(skb->dev),
++					     trace->namespace_id);
++			/* Don't process if Namespace-ID is unknown */
++			if (!ns)
++				goto ignore;
++
++			if (!skb_valid_dst(skb))
++				ip6_route_input(skb);
++
++			if (skb_ensure_writable(skb, optoff + 2 + hdr->opt_len))
++				goto drop;
++
++			nh = skb_network_header(skb) + optoff + sizeof(*hdr);
++			i1hdr = (struct ioam6_integrity_1_hdr *)nh;
++			trace = (struct ioam6_trace_hdr *)(nh + sizeof(*i1hdr));
++
++			ioam6_fill_trace_data(skb, ns, trace, true);
++
++			/* TODO
++			 * For this PoC, we use the node_id (=777) as the
++			 * decapsulating node (i.e., which must not perform the
++			 * GMAC operation).
++			 *
++			 * We can't just check if we're the destination,
++			 * in case of inline insertions for example. We'll also
++			 * need a (bool) per interface sysctl disabled by
++			 * default (e.g., ioam6_integrity_decap).
++			 */
++			/* GMAC the whole trace for next neighbor, unless the
++			 * decap role is enabled
++			 */
++			if (dev_net(skb->dev)->ipv6.sysctl.ioam6_id != 777
++			    && !ioam6_aes_gmac(
++					ioam6_crypto(dev_net(skb->dev)),
++					i1hdr->nonce, i1hdr->icv, (u8 *)trace,
++					hdr->opt_len - 2 - sizeof(*i1hdr)))
++				goto drop;
++
++			break;
++		default:
++			break;
++		}
++
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/net/ipv6/ioam6.c b/net/ipv6/ioam6.c
+index 08c929513065..73164177df4a 100644
+--- a/net/ipv6/ioam6.c
++++ b/net/ipv6/ioam6.c
+@@ -6,6 +6,9 @@
+  *  Justin Iurman <justin.iurman@uliege.be>
+  */
+ 
++#include <crypto/aead.h>
++
++#include <linux/err.h>
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+@@ -694,6 +697,53 @@ struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id)
+ 	return rhashtable_lookup_fast(&nsdata->namespaces, &id, rht_ns_params);
+ }
+ 
++struct crypto_aead *ioam6_crypto(struct net *net)
++{
++	struct ioam6_pernet_data *nsdata = ioam6_pernet(net);
++	return nsdata->tfm;
++}
++
++bool ioam6_aes_gmac(struct crypto_aead *tfm, u8 *iv,
++		    u8 *tag, u8 *aad, size_t aad_len)
++{
++	struct aead_request *aead_req;
++	struct scatterlist sg[2];
++
++	if (!aad_len)
++		return false;
++
++	aead_req = aead_request_alloc(tfm, GFP_ATOMIC);
++	if (!aead_req)
++		return false;
++
++	sg_init_table(sg, ARRAY_SIZE(sg));
++	sg_set_buf(&sg[0], aad, aad_len);
++	sg_set_buf(&sg[1], tag, IOAM6_GMAC_TAG_SIZE);
++
++	aead_request_set_tfm(aead_req, tfm);
++	aead_request_set_crypt(aead_req, sg, sg, 0, iv);
++	aead_request_set_ad(aead_req, aad_len);
++
++	if (crypto_aead_encrypt(aead_req)) {
++		aead_request_free(aead_req);
++		return false;
++	}
++
++	aead_request_free(aead_req);
++	return true;
++}
++
++bool ioam6_valid_aes_gmac(struct crypto_aead *tfm, u8 *iv,
++			  u8 *tag, u8 *aad, size_t aad_len)
++{
++	u8 icv[IOAM6_GMAC_TAG_SIZE];
++
++	if (!ioam6_aes_gmac(tfm, iv, icv, aad, aad_len))
++		return false;
++
++	return memcmp(icv, tag, IOAM6_GMAC_TAG_SIZE) == 0;
++}
++
+ static void __ioam6_fill_trace_data(struct sk_buff *skb,
+ 				    struct ioam6_namespace *ns,
+ 				    struct ioam6_trace_hdr *trace,
+@@ -979,8 +1029,35 @@ static int __net_init ioam6_net_init(struct net *net)
+ 	if (err)
+ 		goto free_rht_ns;
+ 
++	nsdata->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
++	if (IS_ERR(nsdata->tfm)) {
++		err = 1;
++		goto free_rht_sch;
++	}
++
++	/* TODO
++	 * Right now, for this PoC, we use a static key.
++	 * We'll need to configure it via Netlink (e.g., with iproute2) and
++	 * attach it to the crypto_aead struct "later" than now/here.
++	 */
++	u8 key[] = { 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa,
++			0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0x11, 0x12, 0x13, 0x14,
++			0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
++			0x1e, 0x1f }; //32 bytes -> AES-256
++
++	err = crypto_aead_setkey(nsdata->tfm, key, sizeof(key));
++	if (err)
++		goto free_crypto_aead;
++
++	err = crypto_aead_setauthsize(nsdata->tfm, IOAM6_GMAC_TAG_SIZE);
++	if (err)
++		goto free_crypto_aead;
+ out:
+ 	return err;
++free_crypto_aead:
++	crypto_free_aead(nsdata->tfm);
++free_rht_sch:
++	rhashtable_destroy(&nsdata->schemas);
+ free_rht_ns:
+ 	rhashtable_destroy(&nsdata->namespaces);
+ free_nsdata:
+@@ -993,6 +1070,8 @@ static void __net_exit ioam6_net_exit(struct net *net)
+ {
+ 	struct ioam6_pernet_data *nsdata = ioam6_pernet(net);
+ 
++	crypto_free_aead(nsdata->tfm);
++
+ 	rhashtable_free_and_destroy(&nsdata->namespaces, ioam6_free_ns, NULL);
+ 	rhashtable_free_and_destroy(&nsdata->schemas, ioam6_free_sc, NULL);
+ 
+diff --git a/net/ipv6/ioam6_iptunnel.c b/net/ipv6/ioam6_iptunnel.c
+index 7563f8c6aa87..e5a02d798156 100644
+--- a/net/ipv6/ioam6_iptunnel.c
++++ b/net/ipv6/ioam6_iptunnel.c
+@@ -29,6 +29,7 @@ struct ioam6_lwt_encap {
+ 	struct ipv6_hopopt_hdr eh;
+ 	u8 pad[2];			/* 2-octet padding for 4n-alignment */
+ 	struct ioam6_hdr ioamh;
++	struct ioam6_integrity_1_hdr inth;
+ 	struct ioam6_trace_hdr traceh;
+ } __packed;
+ 
+@@ -183,13 +184,34 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
+ 	tuninfo = ioam6_lwt_info(lwt);
+ 	tuninfo->eh.hdrlen = ((sizeof(*tuninfo) + len_aligned) >> 3) - 1;
+ 	tuninfo->pad[0] = IPV6_TLV_PADN;
+-	tuninfo->ioamh.type = IOAM6_TYPE_PREALLOC;
++	tuninfo->ioamh.type = IOAM6_TYPE_INT_PREALLOC;
+ 	tuninfo->ioamh.opt_type = IPV6_TLV_IOAM;
+-	tuninfo->ioamh.opt_len = sizeof(tuninfo->ioamh) - 2 + sizeof(*trace)
+-					+ trace->remlen * 4;
++	tuninfo->ioamh.opt_len = sizeof(tuninfo->ioamh) - 2
++					+ sizeof(tuninfo->inth)
++					+ sizeof(*trace) + trace->remlen * 4;
+ 
+ 	memcpy(&tuninfo->traceh, trace, sizeof(*trace));
+ 
++	tuninfo->inth.suite_id = IOAM6_INTEGRITY_1;
++	tuninfo->inth.nonce_len = IOAM6_GMAC_NONCE_SIZE;
++
++	/* TODO
++	 * Right now, for this PoC, we use a static nonce.
++	 * We'll need to generate one instead.
++	 */
++	tuninfo->inth.nonce[0] = 0x02;
++	tuninfo->inth.nonce[1] = 0x04;
++	tuninfo->inth.nonce[2] = 0x06;
++	tuninfo->inth.nonce[3] = 0x08;
++	tuninfo->inth.nonce[4] = 0x0a;
++	tuninfo->inth.nonce[5] = 0x0c;
++	tuninfo->inth.nonce[6] = 0x0e;
++	tuninfo->inth.nonce[7] = 0x01;
++	tuninfo->inth.nonce[8] = 0x03;
++	tuninfo->inth.nonce[9] = 0x07;
++	tuninfo->inth.nonce[10] = 0x0b;
++	tuninfo->inth.nonce[11] = 0x0f;
++
+ 	if (len_aligned - trace->remlen * 4) {
+ 		tuninfo->traceh.data[trace->remlen * 4] = IPV6_TLV_PADN;
+ 		tuninfo->traceh.data[trace->remlen * 4 + 1] = 2;
+@@ -205,17 +227,26 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
+ 
+ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
+ {
++	struct ioam6_integrity_1_hdr *inth;
+ 	struct ioam6_trace_hdr *trace;
+ 	struct ioam6_namespace *ns;
++	u8 remlen;
++
++	inth = (struct ioam6_integrity_1_hdr *)(skb_transport_header(skb)
++						+ sizeof(struct ipv6_hopopt_hdr)
++						+ 2 + sizeof(struct ioam6_hdr));
+ 
+-	trace = (struct ioam6_trace_hdr *)(skb_transport_header(skb)
+-					   + sizeof(struct ipv6_hopopt_hdr) + 2
+-					   + sizeof(struct ioam6_hdr));
++	trace = (struct ioam6_trace_hdr *)((u8 *)inth + sizeof(*inth));
++	remlen = trace->remlen;
+ 
+ 	ns = ioam6_namespace(net, trace->namespace_id);
+ 	if (ns)
+ 		ioam6_fill_trace_data(skb, ns, trace, false);
+ 
++	if (!ioam6_aes_gmac(ioam6_crypto(net), inth->nonce, inth->icv,
++			    (u8 *)trace, sizeof(*trace) + remlen * 4))
++		return 1;
++
+ 	return 0;
+ }
+ 
